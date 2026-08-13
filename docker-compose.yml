@@ -1,0 +1,36 @@
+# Local dev only — homelab production stack (with OpenSearch, MinIO, mediasoup,
+# coturn, Caddy/Traefik) is separate and comes later per Spec Section 24.
+# This gives backend work a Postgres + Redis to run against without touching
+# the homelab yet.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: noschat-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: noschat
+      POSTGRES_PASSWORD: noschat
+      POSTGRES_DB: noschat
+    ports:
+      - "5432:5432"
+    volumes:
+      - noschat_postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noschat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: noschat-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - noschat_redis_dev_data:/data
+
+volumes:
+  noschat_postgres_dev_data:
+  noschat_redis_dev_data:
