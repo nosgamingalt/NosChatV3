@@ -8,7 +8,7 @@
 
 1. **On session start:** Read this whole file top to bottom before writing any code or making any changes. Do not ask the user "what were we working on" — it's answered in Section 3 (Current Status) and Section 4 (Next Steps).
 2. **Check the spec:** `NosChatV3-Spec-v2.md` (in the project root) is the full product/architecture spec. This file is the *state tracker*; the spec is the *source of truth for what to build*. If they ever conflict, the spec wins on product decisions, this file wins on "what's actually been done so far."
-   - **NOTE:** The spec file has still not actually been placed in this repo — only this CLAUDE.md was carried over from the planning session. Locate/re-attach `NosChatV3-Spec-v2.md` and add it to the repo root ASAP; until then, Section 1 below is the only architecture reference in-repo.
+   - **NOTE:** The spec file has still not actually been placed in this repo. The auth DB schema and routes below were built as a **reasonable best-guess standard design** (email/username + Argon2id + JWT, WebAuthn table stubbed for later) rather than from the real spec — this needs reconciling once the spec is available. See Section 5 for what was guessed and why.
 3. **During the session:** After completing any meaningful step (a feature, a fix, a config change, a decision made with the user, a blocker hit), update this file immediately — don't wait until the end of the session. Meaningful = anything the next session needs to know to not repeat work or re-ask a question.
 4. **Update discipline:**
    - Update **Section 3 (Current Status)** so it always reflects the true current state.
@@ -53,49 +53,54 @@
 - **Domain name in use:** not yet provided by user
 - **Vercel project:** not yet created
 - **Local dev — how to run:**
-  - Frontend: `cd frontend && npm run dev` (Next.js dev server)
-  - Backend: `cd backend && cargo run --bin auth-service` (binds `0.0.0.0:4000`, exposes `GET /health`)
+  - Frontend: `cd frontend && npm run dev` (Next.js dev server, pinned to **port 3100** — see quirk below)
+  - Backend: `cd backend && cargo run --bin auth-service` (binds `0.0.0.0:4000`, exposes `GET /health`, `POST /register`, `POST /login`)
   - Local DB/cache: `docker compose up -d` from repo root (Postgres on host port **5433**, Redis on 6379)
-- **⚠️ IMPORTANT MACHINE-SPECIFIC QUIRK — dev Postgres runs on port 5433, NOT 5432:** This dev machine has a **pre-existing native Windows PostgreSQL service** (`postgres.exe`, unrelated to this project) already bound to port 5432. When our Docker Postgres container was also mapped to 5432, Windows silently routed connections to the *native* service instead of the container — with different credentials, this surfaced as a deeply misleading `password authentication failed for user "noschat"` error, even though the container itself was healthy and correct. **The container's Postgres logs showed zero connection attempts** during this failure — the confusing part — because the connections were never reaching the container at all. Diagnosed by running `netstat -ano | findstr :5432` and finding two PIDs bound to the port (one was `postgres.exe`). Fix: `docker-compose.yml` now maps the container to host port **5433** instead. `DATABASE_URL` fallback in `auth-service/src/main.rs` and `.env.example` both updated to match. **If a fresh session ever sees "password auth failed" against local Postgres again, check `netstat -ano | findstr :5432` for a port conflict before assuming the credentials are wrong.**
+- **⚠️ MACHINE-SPECIFIC QUIRK #1 — dev Postgres runs on port 5433, NOT 5432:** This dev machine has a **pre-existing native Windows PostgreSQL service** (`postgres.exe`, unrelated to this project) already bound to port 5432. When our Docker Postgres container was also mapped to 5432, Windows silently routed connections to the *native* service instead of the container — with different credentials, this surfaced as a deeply misleading `password authentication failed for user "noschat"` error, even though the container itself was healthy and correct. **The container's Postgres logs showed zero connection attempts** during this failure — the confusing part — because the connections were never reaching the container at all. Diagnosed by running `netstat -ano | findstr :5432` and finding two PIDs bound to the port (one was `postgres.exe`). Fix: `docker-compose.yml` now maps the container to host port **5433** instead. `DATABASE_URL` fallback in `auth-service/src/main.rs` and `.env.example` both updated to match. **If a fresh session ever sees "password auth failed" against local Postgres again, check `netstat -ano | findstr :5432` for a port conflict before assuming the credentials are wrong.**
+- **⚠️ MACHINE-SPECIFIC QUIRK #2 — frontend dev server pinned to port 3100, NOT the Next.js default 3000:** This machine has a **system-wide `PORT=4100` environment variable** set (unrelated to this project, likely leftover from another project's ambient shell config), which overrides Next.js's default port and caused `next dev` to fail with `EADDRINUSE` when that port was already taken. Fix: `frontend/package.json` dev/start scripts now explicitly pass `-p 3100` rather than relying on ambient `$PORT`/`%PORT%`. **If `next dev` ever silently binds to an unexpected port again, check for a stray `PORT` env var (`echo %PORT%` on Windows) before assuming a config bug.**
 - **Local toolchain verified present:** Node v24.11.0, npm 11.17.0, rustc 1.94.0, cargo 1.94.0, Docker 29.6.2, git 2.51.2
-- **Secrets / env vars:** `backend/auth-service/.env.example` documents the expected names (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`) with placeholder values only. No real `.env` created, nothing secret exists yet.
+- **Secrets / env vars:** `backend/auth-service/.env.example` documents the expected names (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`) with placeholder values only, updated to reflect port 5433. No real `.env` created, nothing secret exists yet.
 
 ---
 
 ## 3. Current Status
 
-**Phase:** Local dev environment fully scaffolded and verified end-to-end. No feature code (auth logic, DB schema, real UI) written yet.
+**Phase:** Real auth backend (register/login) and matching frontend pages built and verified end-to-end against a real local Postgres. Schema is a best-guess standard design pending the real spec (see Section 0.2 and Section 5). No other feature areas (messaging, realtime, etc.) started.
 
 **What exists and is VERIFIED working (actually run, not just written):**
-- `frontend/` — Next.js 16 (App Router, TypeScript, Tailwind v4, ESLint), scaffolded via `create-next-app`, shadcn/ui initialized. `npm run build` succeeds cleanly. `next.config.ts` pins `turbopack.root` (fixes an unrelated root-detection warning caused by a stray `package-lock.json` in a parent directory outside the repo).
-- `backend/` — Cargo workspace, one member `auth-service`. `cargo build` succeeds cleanly. Minimal Axum server binds `0.0.0.0:4000`, exposes `GET /health` → `{"status":"ok","service":"auth-service","db": <bool>}`. Does NOT crash if Postgres is unreachable at startup (logs a warning, still serves `/health` with `db:false`).
-- `docker-compose.yml` — Postgres 16 (host port **5433**, see the quirk noted in Section 2) + Redis 7 (6379), local dev only. **Ran `docker compose up -d`, confirmed both containers report `healthy`/`Up`.**
-- **Full end-to-end DB connectivity verified:** started `auth-service` with the real Postgres container up, curled `/health`, got `{"db":true,"service":"auth-service","status":"ok"}`. This is the first real proof the whole local chain (Rust app → sqlx → Docker Postgres) actually works. Also independently confirmed Postgres reachability with a throwaway Node.js `pg` test script (`node-postgres`) before touching the Rust side, to isolate whether an earlier failure was Rust/sqlx-specific or environmental — it was environmental (the port conflict), not a code bug.
+- `frontend/` — Next.js 16 (App Router, TypeScript, Tailwind v4, ESLint, shadcn/ui). `npm run build` succeeds cleanly, producing static `/`, `/login`, `/register` routes. Dev server confirmed live via curl: `/` → 307 to `/login`, `/login` → 200, `/register` → 200, with real HTML/CSS rendered (dark self-hosted-themed design, not default boilerplate). Root layout metadata updated from the default "Create Next App" title to a real NosChat title/description.
+- `backend/auth-service` — Axum server, `cargo build` succeeds cleanly. Routes:
+  - `GET /health` → `{"status":"ok","service":"auth-service","db":<bool>}`, does not crash if Postgres is unreachable at startup.
+  - `POST /register` → Argon2id-hashes the password, inserts a user row, issues a JWT. **Verified:** success case, duplicate email/username → `409`, validation failure (e.g. short password) → `400`.
+  - `POST /login` → verifies password against the Argon2id hash, issues a JWT on success. **Verified:** correct credentials → `200` with JWT, wrong password → `401`.
+- First `sqlx` migration (`0001_init_users.sql`) applied cleanly against the local dev Postgres — `users` and `webauthn_credentials` tables confirmed present via `psql \d`. **This schema is a best-guess standard design (see Section 5), not derived from the real spec — expect it to need revision once `NosChatV3-Spec-v2.md` is back in the repo.**
+- `docker-compose.yml` — Postgres 16 (host port **5433**) + Redis 7 (6379), local dev only. Both containers confirmed `healthy`/`Up`.
+- Frontend `/login` and `/register` pages built: dark graphite theme, monospace status branding ("self-hosted — no Firebase, no Clerk, your homelab"), real forms wired to `auth-api.ts` client calling the live backend endpoints. Session persistence (where the JWT is stored — cookie vs. `localStorage`) is intentionally still a stub (`window.alert` on success) pending the real spec's session-handling requirements — **do not treat this as done**, it's a deliberate placeholder.
 - `.gitignore` — excludes `node_modules/`, `.next/`, `target/`, all `.env*` except `.env.example`.
-- Git repo initialized, branch `main`, **three commits** — initial scaffold, a CLAUDE.md accuracy pass, and (pending, see below) this session's Postgres-port fix.
+- Git repo initialized, branch `main`, **four commits** as of this session (scaffold → CLAUDE.md accuracy pass → Postgres port fix → this session's auth backend + frontend pages).
 
 **What does NOT exist yet:**
-- No repo remote (GitHub/GitLab/self-hosted Git/etc.) — repo is local-only. Worth asking the user which they want, given the project's "avoid third-party where possible" spirit — don't just default to GitHub without asking.
-- No auth logic at all: no DB schema/migrations, no user table, no Argon2id password hashing, no JWT issuance/validation, no TOTP, no WebAuthn.
-- No frontend auth pages, no layout beyond the default `create-next-app` boilerplate homepage.
+- No repo remote (GitHub/GitLab/self-hosted Git/etc.) — repo is local-only. Ask the user which they want before defaulting to anything, given the project's "avoid third-party where possible" spirit.
+- No TOTP, no WebAuthn flows (table exists, unused). No password reset, no email verification, no rate limiting on auth endpoints.
+- No real JWT session handling on the frontend (see stub note above) — no protected routes, no logout, no dashboard/homepage beyond the redirect-to-login stub.
 - No homelab Docker stack, no domain/DNS/reverse proxy config, no Vercel project.
-- `NosChatV3-Spec-v2.md` has **not been placed in the repo** — it was produced in the prior planning session but only this CLAUDE.md carried over. Section 1 above is a summary only, not a substitute for the real spec.
+- `NosChatV3-Spec-v2.md` has **not been placed in the repo**. The auth schema/routes above were built without it — reconciling against the real spec is the top priority next step.
 - Minor cosmetic note: `create-next-app` auto-generated `frontend/CLAUDE.md` (a one-line stub: `@AGENTS.md`) and `frontend/AGENTS.md`. Unrelated to this root `CLAUDE.md`, harmless — don't confuse the two.
 
-**Active blockers:** None. The local dev stack (frontend build, backend build, Postgres, Redis, and the auth-service↔Postgres connection) is fully working and verified as of this session.
+**Active blockers:** None. The full local chain — Postgres → auth-service → frontend pages — is up, tested, and torn down cleanly at the end of this session (no leftover background processes).
 
 ---
 
 ## 4. Next Steps (concrete pickup point)
 
-1. **Locate and re-add `NosChatV3-Spec-v2.md`** to the repo root — it exists from the prior planning session but was never placed on disk here; ask the user for it if it can't be found elsewhere. Until it's in-repo, treat Section 1 above as the only architecture reference.
-2. Design and write the first `sqlx` migration for `auth-service` — at minimum a `users` table (id, email, username, password_hash, created_at, etc.). Check the re-attached spec for the exact intended schema before inventing one. Remember local Postgres is on **port 5433**, not 5432 (see Section 2 quirk).
-3. Implement real auth-service routes: `POST /register` (Argon2id hash + insert user), `POST /login` (verify password, issue JWT), wired to the real DB via `sqlx::query!` (compile-time checked — needs `DATABASE_URL` reachable at build time, or `cargo sqlx prepare` for offline builds).
-4. On the frontend: build basic login/register pages (`frontend/src/app/(auth)/login`, `.../register`) that call the auth-service endpoints once they exist — Phase 1 MVP scope only, no real-time features yet.
-5. Set up a remote for the repo — confirm with the user whether they want GitHub, GitLab, or self-hosted Git on the homelab before defaulting to anything.
-6. Homelab Docker stack + domain/DNS/reverse proxy (Spec Section 24) comes after steps 1–5 are solid locally — don't jump ahead to this.
+1. **Locate and re-add `NosChatV3-Spec-v2.md`** to the repo root — ask the user for it if it can't be found elsewhere. Once available, reconcile the guessed `users`/`webauthn_credentials` schema and the `/register`/`/login` routes against it; expect some rework (e.g. exact field set, username rules, session model).
+2. Decide and implement real JWT session persistence on the frontend (cookie-based is the likely spec-aligned choice for a self-hosted app talking cross-origin to Vercel, but confirm against the spec rather than assuming) — replace the current `window.alert` stub.
+3. Add a minimal protected route/dashboard so login success has somewhere real to go, instead of redirecting back to `/login`.
+4. Set up a remote for the repo — confirm with the user whether they want GitHub, GitLab, or self-hosted Git on the homelab before defaulting to anything.
+5. TOTP/WebAuthn second-factor flows come after the above is solid — don't jump ahead to this.
+6. Homelab Docker stack + domain/DNS/reverse proxy (Spec Section 24) comes after local auth + basic app shell are solid — don't jump ahead to this either.
 
-**Immediate next action if resuming right now:** Step 1 — get the real spec file into the repo, since schema and route design (steps 2–3) depend on it rather than a guessed-at schema.
+**Immediate next action if resuming right now:** Step 1 — get the real spec file into the repo before doing any more schema or route work on top of the guessed design.
 
 ---
 
@@ -103,7 +108,9 @@
 
 *(Anything decided that adds to, changes, or deviates from the spec — so it's not lost or re-litigated. Most recent first.)*
 
-- **Moved local dev Postgres from host port 5432 to 5433** in `docker-compose.yml` (and updated the matching `DATABASE_URL` defaults in `auth-service` and `.env.example`) because this specific dev machine has a pre-existing native Windows Postgres service already on 5432. This is a machine-specific workaround, not a spec-level decision — if this project is ever developed on a different machine without that conflict, 5432 would work fine, but 5433 is harmless either way so there's no need to revert it.
+- **Built the first auth schema and `/register`/`/login` routes as a best-guess standard design**, since `NosChatV3-Spec-v2.md` was still not available in-repo after two sessions of asking. Design: `users` table (id, email, username, password_hash via Argon2id, created_at) + an empty `webauthn_credentials` table stubbed for later, JWT issued on register/login. Explicitly flagged in migration comments and here as **not derived from the real spec** — treat as provisional and expect revision once the spec is back.
+- **Pinned the frontend dev server to port 3100** (via explicit `-p 3100` in `package.json` scripts) because a system-wide `PORT=4100` env var on this machine (unrelated to this project) was overriding Next.js's default and causing `EADDRINUSE`. Machine-specific workaround, not a spec-level decision.
+- **Moved local dev Postgres from host port 5432 to 5433** in `docker-compose.yml` (and updated the matching `DATABASE_URL` defaults in `auth-service` and `.env.example`) because this specific dev machine has a pre-existing native Windows Postgres service already on 5432. Machine-specific workaround, not a spec-level decision — harmless to keep even on a machine without the conflict.
 - Confirmed monorepo structure (frontend + backend in one repo) with user.
 - Pivoted away from Flutter/Clerk/Firebase/Cloudflare R2 (original v1.0 spec) to Next.js/self-hosted-auth/MinIO, because the user's actual hosting plan (homelab backend+DB, Vercel frontend, custom domain, zero Firebase) required it. Full rationale in spec Section 24 and ADR log (spec file to be re-attached, see Section 0.2 note).
 
@@ -142,6 +149,18 @@
   - Cleaned up: killed the test `auth-service.exe` process, deleted the throwaway Node test folder and run logs, nothing test-related left in the repo.
 - Documented the port-conflict quirk prominently in Section 2 (with the diagnostic command to check first if this ever resurfaces) and in the Decisions log, so a future session doesn't waste time re-debugging the same misleading error.
 - **Session ends here, local dev environment is fully working.** Next session starts at Section 4, Step 1: get the real spec file into the repo before starting on the DB schema.
+
+### Session 4
+- Spec file still not available. Proceeded with a best-guess standard auth schema/routes rather than blocking further, flagged clearly as provisional (see Section 5).
+- Wrote and applied the first `sqlx` migration (`0001_init_users.sql`) — `users` and `webauthn_credentials` tables confirmed present in the dev Postgres (port 5433) via `psql \d`.
+- Implemented `POST /register` and `POST /login` in `auth-service` (Argon2id hashing/verification, JWT issuance). **Verified live against the real DB, not just compiled:** register success, duplicate email/username → `409`, wrong password → `401`, validation failure (short password) → `400`, correct login → `200` with JWT.
+- Built `/login` and `/register` frontend pages — dark, self-hosted/homelab-themed design (deliberate departure from a generic SaaS look, to match the project's actual identity), wired to the real backend via a new `src/lib/auth-api.ts` client. `npm run build` passes clean with both routes present.
+- Hit and fixed a second machine-specific environment collision: a system-wide `PORT=4100` env var (unrelated to this project) made `next dev` fail with `EADDRINUSE`. Pinned the frontend dev server to **port 3100** explicitly in `package.json` rather than relying on ambient env state — documented in Section 2 as Quirk #2.
+- **Verified live, not just curled for status codes:** fetched the actual rendered HTML for `/login` — confirmed the dark self-hosted theme, working form markup, and the register-page link render correctly, not just a `200`.
+- Noticed and fixed a leftover cosmetic issue: root layout metadata still said the default "Create Next App" title — updated to real NosChat title/description, reconfirmed `npm run build` still passes clean after the change.
+- Cleaned up: killed the leftover `auth-service.exe` and `next dev` (port 3100) background processes from the prior session's work, deleted throwaway `run.log`/`frontend-run.log` files.
+- Committed this session's work (migration, auth routes, frontend auth pages, port-3100 fix, layout metadata fix) to `main`.
+- **Session ends here.** Next session starts at Section 4, Step 1: get the real spec file into the repo — the guessed schema and routes need reconciling against it before building further (session persistence, protected routes, TOTP/WebAuthn).
 
 ---
 
