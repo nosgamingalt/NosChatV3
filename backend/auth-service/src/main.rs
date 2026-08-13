@@ -13,8 +13,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    // NOTE: local dev Postgres runs on host port 5433, not the default 5432 —
+    // this machine has a pre-existing native Windows Postgres service bound
+    // to 5432 that isn't part of this project. See docker-compose.yml.
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://noschat:noschat@localhost:5432/noschat".to_string());
+        .unwrap_or_else(|_| "postgres://noschat:noschat@localhost:5433/noschat".to_string());
 
     // Attempt to connect, but don't crash the whole service if the DB isn't up yet
     // during early local scaffolding — /health should still report DB status.

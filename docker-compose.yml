@@ -13,7 +13,13 @@ services:
       POSTGRES_PASSWORD: noschat
       POSTGRES_DB: noschat
     ports:
-      - "5432:5432"
+      # Mapped to 5433 on the host, not 5432 — this machine already has a
+      # native Windows PostgreSQL service bound to 5432 (unrelated to this
+      # project), which was silently intercepting connections meant for this
+      # container (same symptom as wrong credentials, very confusing to debug).
+      # Postgres inside the container still listens on 5432 as normal; only
+      # the host-side port mapping changed.
+      - "5433:5432"
     volumes:
       - noschat_postgres_dev_data:/var/lib/postgresql/data
     healthcheck:
