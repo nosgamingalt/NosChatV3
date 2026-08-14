@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+axum-extra = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -13,10 +14,11 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+svix = { workspace = true }

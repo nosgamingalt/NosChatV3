@@ -9,7 +9,8 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-axum = "0.7"
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -25,3 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 thiserror = "2"
 anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+svix = "1"
