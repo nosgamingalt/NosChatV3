@@ -177,6 +177,12 @@ export function ChatApp({
   }, [getToken]);
 
   useEffect(() => {
+    // Everything that touches state lives inside this one async IIFE and is
+    // awaited, rather than firing refreshFriends()/refreshDms() directly in
+    // the effect body — calling a setState-triggering function synchronously
+    // from an effect body (even fire-and-forget) trips
+    // react-hooks/set-state-in-effect, since React can't tell it's actually
+    // async work landing later.
     (async () => {
       const token = await getToken();
       if (!token) return;
@@ -190,9 +196,8 @@ export function ChatApp({
             : "Backend sync issue — is the auth-service running?",
         );
       }
+      await Promise.all([refreshFriends(), refreshDms()]);
     })();
-    void refreshFriends();
-    void refreshDms();
     // Runs once on mount — refreshFriends/refreshDms are stable-enough
     // callbacks and re-running this on every getToken identity change would
     // refetch on every render for no reason.
