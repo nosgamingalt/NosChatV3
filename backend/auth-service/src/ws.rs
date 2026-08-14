@@ -1,7 +1,7 @@
 //! In-process WebSocket hub for real-time fan-out (new messages, friend
-//! requests). One user can have multiple live connections (multiple tabs/
-//! devices), so we keep a Vec of senders per user id and clean up dead ones
-//! lazily on send failure.
+//! requests, typing indicators). One user can have multiple live
+//! connections (multiple tabs/devices), so we keep a Vec of senders per
+//! user id and clean up dead ones lazily on send failure.
 //!
 //! This is in-memory, single-process fan-out — fine for one backend
 //! instance. The spec's long-term design (Section 8.1) is Redis pub/sub so
@@ -13,7 +13,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -66,6 +66,47 @@ pub struct WsAuthQuery {
     token: String,
 }
 
+/// Messages the client can send *up* the socket. Currently just typing
+/// presence — everything else (sending a message, friending, etc.) goes
+/// through the regular HTTP API and gets fanned back out over the socket
+/// from there.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientEvent {
+    Typing { dm_id: Uuid },
+}
+
+/// Looks up the DM's participants, confirms `user_id` is actually one of
+/// them (silently drops the event otherwise — this is public-facing input
+/// off the socket), and fans the typing event out to everyone else in the
+/// DM. No persistence — typing state is deliberately ephemeral; the client
+/// expires its own "is typing" flag a few seconds after the last event.
+async fn handle_client_event(state: &AppState, user_id: Uuid, event: ClientEvent) {
+    match event {
+        ClientEvent::Typing { dm_id } => {
+            let participants: Vec<(Uuid,)> =
+                match sqlx::query_as("SELECT user_id FROM dm_participants WHERE dm_id = $1")
+                    .bind(dm_id)
+                    .fetch_all(&state.db)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!("typing: failed to look up dm participants: {e}");
+                        return;
+                    }
+                };
+            let ids: Vec<Uuid> = participants.into_iter().map(|(id,)| id).collect();
+            if !ids.contains(&user_id) {
+                return;
+            }
+            let others: Vec<Uuid> = ids.into_iter().filter(|id| *id != user_id).collect();
+            let payload = json!({ "type": "typing", "dm_id": dm_id, "user_id": user_id });
+            state.ws_hub.send_to_many(&others, payload).await;
+        }
+    }
+}
+
 /// `GET /ws?token=<clerk session jwt>` — browsers can't set custom headers
 /// on the WebSocket handshake, so the Clerk token travels as a query param
 /// here instead of the `Authorization` header used everywhere else.
@@ -112,17 +153,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid) {
         }
     });
 
-    // We don't expect meaningful client->server messages yet (no typing
-    // indicators wired up), but we must drain the receiver so pings/closes
-    // are handled and the connection doesn't look hung.
-    let hub = state.ws_hub.clone();
+    // Client->server traffic: typing events parsed and fanned out here;
+    // anything else (unparseable frames, pings) is drained and ignored so
+    // the connection doesn't look hung.
+    let state_for_recv = state.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
-            if matches!(msg, WsMessage::Close(_)) {
-                break;
+            match msg {
+                WsMessage::Close(_) => break,
+                WsMessage::Text(text) => {
+                    if let Ok(event) = serde_json::from_str::<ClientEvent>(&text) {
+                        handle_client_event(&state_for_recv, user_id, event).await;
+                    }
+                }
+                _ => {}
             }
         }
-        hub.prune(user_id).await;
+        state_for_recv.ws_hub.prune(user_id).await;
     });
 
     tokio::select! {

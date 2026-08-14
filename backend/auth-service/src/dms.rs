@@ -117,10 +117,13 @@ pub struct DmSummary {
     pub other_email: Option<String>,
     pub last_message: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
+    pub unread_count: i64,
 }
 
 /// `GET /dms` — every DM channel you're in, with the other participant
-/// (1:1 only — group DM listing isn't built yet) and a preview.
+/// (1:1 only — group DM listing isn't built yet), a preview, and how many
+/// messages from the other person are unread (messages after your
+/// `last_read_message_id`, or all of them if you've never read this DM).
 pub async fn list_dms(
     State(state): State<AppState>,
     ClerkUser(claims): ClerkUser,
@@ -135,7 +138,8 @@ pub async fn list_dms(
             u.username AS other_username,
             u.email AS other_email,
             lm.content AS last_message,
-            lm.created_at AS last_message_at
+            lm.created_at AS last_message_at,
+            COALESCE(unread.cnt, 0) AS unread_count
         FROM dm_channels c
         JOIN dm_participants me_p ON me_p.dm_id = c.id AND me_p.user_id = $1
         LEFT JOIN dm_participants other_p ON other_p.dm_id = c.id AND other_p.user_id <> $1
@@ -144,6 +148,17 @@ pub async fn list_dms(
             SELECT content, created_at FROM messages m
             WHERE m.dm_id = c.id ORDER BY m.created_at DESC LIMIT 1
         ) lm ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS cnt FROM messages m2
+            WHERE m2.dm_id = c.id
+              AND m2.sender_id <> $1
+              AND (
+                me_p.last_read_message_id IS NULL
+                OR m2.created_at > (
+                    SELECT created_at FROM messages WHERE id = me_p.last_read_message_id
+                )
+              )
+        ) unread ON true
         WHERE c.is_group = false
         ORDER BY COALESCE(lm.created_at, c.created_at) DESC
         "#,
@@ -250,6 +265,17 @@ pub async fn send_message(
     .await
     .map_err(internal_err)?;
 
+    // The sender has, by definition, "read" their own message — advance
+    // their own read pointer too so their unread_count for this DM doesn't
+    // tick up from their own send.
+    sqlx::query("UPDATE dm_participants SET last_read_message_id = $1 WHERE dm_id = $2 AND user_id = $3")
+        .bind(msg.id)
+        .bind(dm_id)
+        .bind(me)
+        .execute(&state.db)
+        .await
+        .map_err(internal_err)?;
+
     let participants: Vec<(Uuid,)> = sqlx::query_as("SELECT user_id FROM dm_participants WHERE dm_id = $1")
         .bind(dm_id)
         .fetch_all(&state.db)
@@ -261,4 +287,38 @@ pub async fn send_message(
     state.ws_hub.send_to_many(&recipient_ids, payload).await;
 
     Ok(Json(msg))
+}
+
+/// `POST /dms/:id/read` — marks every message in the DM as read for the
+/// caller (advances `last_read_message_id` to the latest message). No body;
+/// called by the frontend when a DM is opened and while it stays the active
+/// view as new messages arrive in it.
+pub async fn mark_read(
+    State(state): State<AppState>,
+    ClerkUser(claims): ClerkUser,
+    Path(dm_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let me = local_user_id(&state, &claims.sub).await?;
+    assert_participant(&state, dm_id, me).await?;
+
+    let latest: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM messages WHERE dm_id = $1 ORDER BY created_at DESC LIMIT 1")
+            .bind(dm_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(internal_err)?;
+
+    if let Some((last_id,)) = latest {
+        sqlx::query(
+            "UPDATE dm_participants SET last_read_message_id = $1 WHERE dm_id = $2 AND user_id = $3",
+        )
+        .bind(last_id)
+        .bind(dm_id)
+        .bind(me)
+        .execute(&state.db)
+        .await
+        .map_err(internal_err)?;
+    }
+
+    Ok(Json(json!({ "status": "ok" })))
 }

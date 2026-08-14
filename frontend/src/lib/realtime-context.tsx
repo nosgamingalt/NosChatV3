@@ -14,7 +14,8 @@ import { WS_URL } from "@/lib/backend-api";
 export type RealtimeEvent =
   | { type: "message"; message: import("@/lib/backend-api").Message }
   | { type: "friend_request"; friendship_id: string; from: string }
-  | { type: "friend_accepted"; friendship_id: string; from: string };
+  | { type: "friend_accepted"; friendship_id: string; from: string }
+  | { type: "typing"; dm_id: string; user_id: string };
 
 type Listener = (event: RealtimeEvent) => void;
 
@@ -23,6 +24,11 @@ type RealtimeContextValue = {
   // True only while the /ws socket is actually open — a real signal for the
   // UI to reflect (e.g. a "live" indicator), not a decorative always-on dot.
   connected: boolean;
+  // Fire-and-forget: tells the backend "I'm typing in this DM right now" so
+  // it can fan a `typing` event out to the other participant(s). No-ops
+  // silently if the socket isn't open — typing presence is best-effort by
+  // nature, not worth queuing or retrying.
+  sendTyping: (dmId: string) => void;
 };
 
 const RealtimeContext = createContext<RealtimeContextValue | null>(null);
@@ -53,6 +59,13 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   const subscribe = useCallback((listener: Listener) => {
     listeners.current.add(listener);
     return () => listeners.current.delete(listener);
+  }, []);
+
+  const sendTyping = useCallback((dmId: string) => {
+    const socket = socketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "typing", dm_id: dmId }));
+    }
   }, []);
 
   useEffect(() => {
@@ -99,7 +112,7 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <RealtimeContext.Provider value={{ subscribe, connected }}>
+    <RealtimeContext.Provider value={{ subscribe, connected, sendTyping }}>
       {children}
     </RealtimeContext.Provider>
   );

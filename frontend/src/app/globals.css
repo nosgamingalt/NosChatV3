@@ -179,9 +179,26 @@
   animation: rise-in 0.22s ease-out both;
 }
 
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.animate-typing-dot {
+  animation: typing-bounce 1.1s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-signal-pulse,
-  .animate-rise-in {
+  .animate-rise-in,
+  .animate-typing-dot {
     animation: none;
   }
 }

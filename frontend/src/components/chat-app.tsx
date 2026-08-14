@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type KeyboardEvent,
 } from "react";
 import { useAuth, UserButton } from "@clerk/nextjs";
 import {
@@ -16,9 +17,11 @@ import {
   Check,
   X,
   Radio,
+  ChevronLeft,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { avatarRamp, initialOf } from "@/lib/utils";
 import {
   fetchMe,
@@ -30,6 +33,7 @@ import {
   openDm,
   listMessages,
   sendMessage,
+  markDmRead,
   type Friendship,
   type DmSummary,
   type Message,
@@ -137,13 +141,18 @@ export function ChatApp({
   email: string;
 }) {
   const { getToken } = useAuth();
-  const { subscribe, connected } = useRealtime();
+  const { subscribe, connected, sendTyping } = useRealtime();
   const sound = useSoundSettings();
 
   const [myId, setMyId] = useState<string | null>(null);
   const [friends, setFriends] = useState<Friendship[]>([]);
   const [dms, setDms] = useState<DmSummary[]>([]);
   const [view, setView] = useState<View>({ kind: "friends" });
+  // On narrow screens the sidebar list and the active view can't both be on
+  // screen at once, so this tracks which one is showing. Irrelevant at the
+  // md breakpoint and above, where both panels render side by side
+  // regardless of this value (see the "hidden md:flex" pairs below).
+  const [mobileShowDetail, setMobileShowDetail] = useState(false);
   const [messagesByDm, setMessagesByDm] = useState<Record<string, Message[]>>(
     {},
   );
@@ -154,7 +163,15 @@ export function ChatApp({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [soundsOpen, setSoundsOpen] = useState(false);
   const [dmFilter, setDmFilter] = useState("");
+  // Which DM(s) currently have the other person actively typing. Cleared a
+  // few seconds after the last "typing" event for that DM — see the
+  // subscribe handler below — so it behaves like Discord/iMessage: it shows
+  // up fast and fades out on its own if typing stops without a message.
+  const [typingIn, setTypingIn] = useState<Record<string, boolean>>({});
+  const typingTimeouts = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const lastTypingSentRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const refreshFriends = useCallback(async () => {
     const token = await getToken();
@@ -208,6 +225,8 @@ export function ChatApp({
     return subscribe((event) => {
       if (event.type === "message") {
         const m = event.message;
+        const isActiveDm = view.kind === "dm" && view.dmId === m.dm_id;
+
         setMessagesByDm((prev) => {
           const existing = prev[m.dm_id] ?? [];
           if (existing.some((x) => x.id === m.id)) return prev;
@@ -220,19 +239,45 @@ export function ChatApp({
             return prev;
           }
           const updated = [...prev];
+          const bumpsUnread = m.sender_id !== myId && !isActiveDm;
           updated[idx] = {
             ...updated[idx],
             last_message: m.content,
             last_message_at: m.created_at,
+            unread_count: bumpsUnread
+              ? (updated[idx].unread_count ?? 0) + 1
+              : isActiveDm
+                ? 0
+                : updated[idx].unread_count,
           };
           updated.sort((a, b) =>
             (b.last_message_at ?? "").localeCompare(a.last_message_at ?? ""),
           );
           return updated;
         });
+        // A message landing while its DM is the open one counts as read
+        // immediately — no unread badge for a conversation you're already
+        // looking at.
+        if (isActiveDm && m.sender_id !== myId) {
+          void (async () => {
+            const token = await getToken();
+            if (token) void markDmRead(token, m.dm_id).catch(() => {});
+          })();
+        }
+        // Any incoming message implies the sender stopped typing.
+        setTypingIn((prev) => (prev[m.dm_id] ? { ...prev, [m.dm_id]: false } : prev));
         if (m.sender_id !== myId) {
           void sound.play("message");
         }
+      } else if (event.type === "typing") {
+        const dmId = event.dm_id;
+        setTypingIn((prev) => ({ ...prev, [dmId]: true }));
+        const existing = typingTimeouts.current[dmId];
+        if (existing) clearTimeout(existing);
+        typingTimeouts.current[dmId] = setTimeout(() => {
+          setTypingIn((prev) => ({ ...prev, [dmId]: false }));
+          delete typingTimeouts.current[dmId];
+        }, 3000);
       } else if (event.type === "friend_request") {
         void refreshFriends();
         void sound.play("ringtone");
@@ -240,7 +285,14 @@ export function ChatApp({
         void refreshFriends();
       }
     });
-  }, [subscribe, myId, refreshFriends, refreshDms, sound]);
+  }, [subscribe, myId, refreshFriends, refreshDms, sound, view, getToken]);
+
+  // Clear any pending typing-expiry timers on unmount.
+  useEffect(() => {
+    return () => {
+      Object.values(typingTimeouts.current).forEach(clearTimeout);
+    };
+  }, []);
 
   useEffect(() => {
     if (view.kind !== "dm") return;
@@ -251,6 +303,10 @@ export function ChatApp({
       try {
         const msgs = await listMessages(token, dmId);
         setMessagesByDm((prev) => ({ ...prev, [dmId]: msgs }));
+        setDms((prev) =>
+          prev.map((d) => (d.id === dmId ? { ...d, unread_count: 0 } : d)),
+        );
+        void markDmRead(token, dmId).catch(() => {});
       } catch (e) {
         setLoadError(
           e instanceof Error ? e.message : "Failed to load messages",
@@ -261,7 +317,18 @@ export function ChatApp({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [view, messagesByDm]);
+  }, [view, messagesByDm, typingIn]);
+
+  // Auto-grow the composer up to a 6-line cap, then let it scroll — mirrors
+  // the textarea behavior in every mainstream chat app instead of the old
+  // single-line input that clipped longer messages.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const max = 168; // ~6 lines at this font size/line-height
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+  }, [composer, view]);
 
   const acceptedFriends = friends.filter((f) => f.status === "accepted");
   const incoming = friends.filter(
@@ -308,6 +375,11 @@ export function ChatApp({
     await refreshFriends();
   }
 
+  function openFriendsView() {
+    setView({ kind: "friends" });
+    setMobileShowDetail(true);
+  }
+
   async function handleOpenDm(friendUserId: string) {
     const token = await getToken();
     if (!token) return;
@@ -315,9 +387,15 @@ export function ChatApp({
       const { id } = await openDm(token, friendUserId);
       await refreshDms();
       setView({ kind: "dm", dmId: id });
+      setMobileShowDetail(true);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Failed to open DM");
     }
+  }
+
+  function openDmView(dmId: string) {
+    setView({ kind: "dm", dmId });
+    setMobileShowDetail(true);
   }
 
   async function handleSend(e: FormEvent) {
@@ -338,19 +416,41 @@ export function ChatApp({
     }
   }
 
+  // Enter sends (matches the placeholder/send-button affordance); Shift+Enter
+  // inserts a newline, same convention as Slack/Discord/iMessage.
+  function handleComposerKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void handleSend(e as unknown as FormEvent);
+    }
+  }
+
+  function handleComposerChange(value: string) {
+    setComposer(value);
+    if (view.kind === "dm") {
+      const now = Date.now();
+      if (now - lastTypingSentRef.current > 2000) {
+        lastTypingSentRef.current = now;
+        sendTyping(view.dmId);
+      }
+    }
+  }
+
   const activeDm =
     view.kind === "dm" ? dms.find((d) => d.id === view.dmId) : null;
   const activeMessages =
     view.kind === "dm" ? (messagesByDm[view.dmId] ?? []) : [];
   const activeGroups = groupMessages(activeMessages);
   const activeLabel = activeDm?.other_username ?? activeDm?.other_email ?? "?";
+  const activeTyping = view.kind === "dm" && !!typingIn[view.dmId];
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-[#0B0D12]">
-      {/* rail */}
-      <div className="flex w-[72px] flex-none flex-col items-center gap-2 border-r border-[#1D2129] bg-[#0B0D12] py-3">
+    <div className="flex h-dvh w-full overflow-hidden bg-[#0B0D12]">
+      {/* rail — the app switcher strip; only meaningful once there's more
+          than one panel on screen, so it's desktop-only. */}
+      <div className="hidden w-[72px] flex-none flex-col items-center gap-2 border-r border-[#1D2129] bg-[#0B0D12] py-3 md:flex">
         <button
-          onClick={() => setView({ kind: "friends" })}
+          onClick={openFriendsView}
           data-active={view.kind === "friends"}
           className="group relative flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-b from-[#F3B57E] to-[#EB9A50] font-display text-lg text-[#12151A] shadow-[0_1px_0_rgba(255,255,255,0.25)_inset,0_10px_24px_-10px_rgba(240,168,104,0.5)] transition-all duration-200 hover:rounded-xl hover:shadow-[0_1px_0_rgba(255,255,255,0.25)_inset,0_14px_30px_-10px_rgba(240,168,104,0.7)] data-[active=true]:rounded-xl"
           title="NosChat"
@@ -367,8 +467,13 @@ export function ChatApp({
         </div>
       </div>
 
-      {/* sidebar */}
-      <div className="noschat-grain flex w-64 flex-none flex-col border-r border-[#1D2129] bg-[#12151B]">
+      {/* sidebar — the nav/list panel. On mobile this *is* the home screen;
+          it yields the full viewport to the detail panel once something is
+          open (mobileShowDetail), and comes back via each header's back
+          button. From md up, both panels are always visible together. */}
+      <div
+        className={`noschat-grain w-full flex-none flex-col border-r border-[#1D2129] bg-[#12151B] md:flex md:w-72 lg:w-80 ${mobileShowDetail ? "hidden md:flex" : "flex"}`}
+      >
         <div className="flex h-16 flex-none flex-col justify-center border-b border-[#1D2129] px-4">
           <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-[#8B93A1]/70">
             Self-hosted
@@ -385,7 +490,7 @@ export function ChatApp({
         </div>
 
         <button
-          onClick={() => setView({ kind: "friends" })}
+          onClick={openFriendsView}
           data-active={view.kind === "friends"}
           className="group relative mx-2 mt-3 flex items-center gap-2.5 overflow-hidden rounded-lg px-2.5 py-2 text-sm text-[#8B93A1] transition-colors hover:bg-[#1B1F27] hover:text-[#E8EAED] data-[active=true]:bg-[#1B1F27] data-[active=true]:text-[#E8EAED]"
         >
@@ -432,7 +537,7 @@ export function ChatApp({
                 return (
                   <button
                     key={dm.id}
-                    onClick={() => setView({ kind: "dm", dmId: dm.id })}
+                    onClick={() => openDmView(dm.id)}
                     data-active={view.kind === "dm" && view.dmId === dm.id}
                     className="group relative flex w-full items-center gap-2.5 overflow-hidden rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-[#1B1F27] data-[active=true]:bg-[#1B1F27]"
                   >
@@ -444,17 +549,30 @@ export function ChatApp({
                     />
                     <span className="min-w-0 flex-1">
                       <span className="flex items-baseline justify-between gap-2">
-                        <span className="truncate text-sm font-medium text-[#E8EAED]">
+                        <span
+                          className={`truncate text-sm text-[#E8EAED] ${dm.unread_count > 0 ? "font-semibold" : "font-medium"}`}
+                        >
                           {label}
                         </span>
-                        {dm.last_message_at && (
-                          <span className="flex-none font-mono text-[10px] text-[#8B93A1]/70">
-                            {relativeTime(dm.last_message_at)}
-                          </span>
-                        )}
+                        <span className="flex flex-none items-center gap-1.5">
+                          {dm.last_message_at && (
+                            <span className="font-mono text-[10px] text-[#8B93A1]/70">
+                              {relativeTime(dm.last_message_at)}
+                            </span>
+                          )}
+                          {dm.unread_count > 0 && (
+                            <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-[#F0A868] px-1 text-[9px] font-bold text-[#12151A]">
+                              {dm.unread_count > 99 ? "99+" : dm.unread_count}
+                            </span>
+                          )}
+                        </span>
                       </span>
-                      <span className="block truncate text-xs text-[#8B93A1]">
-                        {dm.last_message ?? "No messages yet"}
+                      <span
+                        className={`block truncate text-xs ${dm.unread_count > 0 ? "text-[#C7CDD6]" : "text-[#8B93A1]"}`}
+                      >
+                        {typingIn[dm.id]
+                          ? `${label} is typing…`
+                          : (dm.last_message ?? "No messages yet")}
                       </span>
                     </span>
                   </button>
@@ -491,8 +609,11 @@ export function ChatApp({
         </div>
       </div>
 
-      {/* main */}
-      <div className="relative flex min-w-0 flex-1 flex-col bg-[#161A20]">
+      {/* main — the detail panel. Full-screen on mobile once something's
+          open; permanently visible alongside the sidebar from md up. */}
+      <div
+        className={`relative min-w-0 flex-1 flex-col bg-[#161A20] md:flex ${mobileShowDetail ? "flex" : "hidden md:flex"}`}
+      >
         {loadError && (
           <div className="flex flex-none items-center justify-between gap-2 border-b border-[#EB5757]/20 bg-[#EB5757]/10 px-4 py-2 text-xs text-[#EB5757]">
             <span>{loadError}</span>
@@ -504,12 +625,19 @@ export function ChatApp({
 
         {view.kind === "friends" ? (
           <>
-            <div className="flex h-16 flex-none items-end border-b border-[#1D2129] px-6 pb-3">
+            <div className="flex h-16 flex-none items-end gap-2 border-b border-[#1D2129] px-4 pb-3 md:px-6">
+              <button
+                onClick={() => setMobileShowDetail(false)}
+                className="mb-0.5 -ml-1.5 flex size-7 flex-none items-center justify-center rounded-lg text-[#8B93A1] transition-colors hover:bg-[#1B1F27] hover:text-[#E8EAED] md:hidden"
+                title="Back"
+              >
+                <ChevronLeft className="size-5" />
+              </button>
               <span className="font-display text-3xl italic text-[#E8EAED]">
                 Friends
               </span>
             </div>
-            <div className="flex-1 overflow-y-auto px-6 py-6">
+            <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6">
               <form
                 onSubmit={handleAddFriend}
                 className="mb-8 flex max-w-md gap-2"
@@ -608,7 +736,7 @@ export function ChatApp({
                     </p>
                   </div>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className="grid grid-cols-1 gap-1.5 lg:grid-cols-2">
                     {acceptedFriends.map((f) => {
                       const label = f.username ?? f.email;
                       return (
@@ -624,7 +752,7 @@ export function ChatApp({
                             size="sm"
                             variant="secondary"
                             onClick={() => handleOpenDm(f.user_id)}
-                            className="opacity-0 transition-opacity group-hover:opacity-100"
+                            className="opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100"
                           >
                             <MessageSquare className="size-3.5" /> Message
                           </Button>
@@ -638,7 +766,14 @@ export function ChatApp({
           </>
         ) : (
           <>
-            <div className="flex h-16 flex-none items-center gap-3 border-b border-[#1D2129] px-6">
+            <div className="flex h-16 flex-none items-center gap-2 border-b border-[#1D2129] px-3 md:px-6">
+              <button
+                onClick={() => setMobileShowDetail(false)}
+                className="flex size-7 flex-none items-center justify-center rounded-lg text-[#8B93A1] transition-colors hover:bg-[#1B1F27] hover:text-[#E8EAED] md:hidden"
+                title="Back"
+              >
+                <ChevronLeft className="size-5" />
+              </button>
               <Avatar
                 seed={activeDm?.other_user_id ?? activeLabel}
                 label={activeLabel}
@@ -647,15 +782,17 @@ export function ChatApp({
                 <p className="truncate text-sm font-semibold text-[#E8EAED]">
                   {activeLabel}
                 </p>
-                {activeDm?.other_email && (
-                  <p className="truncate text-xs text-[#8B93A1]">
-                    {activeDm.other_email}
-                  </p>
-                )}
+                <p className="truncate text-xs text-[#8B93A1]">
+                  {activeTyping ? (
+                    <span className="text-[#F0A868]">typing…</span>
+                  ) : (
+                    activeDm?.other_email
+                  )}
+                </p>
               </div>
             </div>
 
-            <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-5">
+            <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-5 md:px-6">
               {activeGroups.length === 0 ? (
                 <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
                   <Avatar
@@ -689,7 +826,7 @@ export function ChatApp({
                           />
                         )}
                         <div
-                          className={`flex max-w-[65%] flex-col gap-1 ${mine ? "items-end" : "items-start"}`}
+                          className={`flex max-w-[85%] flex-col gap-1 sm:max-w-[70%] lg:max-w-[65%] ${mine ? "items-end" : "items-start"}`}
                         >
                           {group.messages.map((m, mi) => (
                             <div
@@ -702,7 +839,7 @@ export function ChatApp({
                                 </span>
                               )}
                               <div
-                                className={`rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
+                                className={`whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed break-words ${
                                   mine
                                     ? "bg-gradient-to-b from-[#F3B57E] to-[#EB9A50] text-[#12151A]"
                                     : "bg-[#1E232C] text-[#E8EAED]"
@@ -723,22 +860,39 @@ export function ChatApp({
                   })}
                 </div>
               )}
+              {activeTyping && (
+                <div className="mt-2 flex animate-rise-in items-end gap-2.5">
+                  <Avatar
+                    seed={activeDm?.other_user_id ?? activeLabel}
+                    label={activeLabel}
+                    size="sm"
+                  />
+                  <div className="flex items-center gap-1 rounded-2xl bg-[#1E232C] px-3.5 py-3">
+                    <span className="h-1.5 w-1.5 animate-typing-dot rounded-full bg-[#8B93A1] [animation-delay:0ms]" />
+                    <span className="h-1.5 w-1.5 animate-typing-dot rounded-full bg-[#8B93A1] [animation-delay:150ms]" />
+                    <span className="h-1.5 w-1.5 animate-typing-dot rounded-full bg-[#8B93A1] [animation-delay:300ms]" />
+                  </div>
+                </div>
+              )}
             </div>
 
-            <form onSubmit={handleSend} className="flex-none px-6 pb-5">
-              <div className="relative">
-                <Input
+            <form onSubmit={handleSend} className="flex-none px-3 pb-4 md:px-6 md:pb-5">
+              <div className="relative flex items-end">
+                <Textarea
+                  ref={composerRef}
+                  rows={1}
                   value={composer}
-                  onChange={(e) => setComposer(e.target.value)}
+                  onChange={(e) => handleComposerChange(e.target.value)}
+                  onKeyDown={handleComposerKeyDown}
                   placeholder={`Message ${activeLabel}`}
-                  className="h-12 rounded-full border-[#2A2F3A] bg-[#0F1217]/80 pr-12 pl-4 text-[#E8EAED] placeholder:text-[#8B93A1]/60 focus-visible:border-[#F0A868]/50 focus-visible:ring-[#F0A868]/20"
+                  className="max-h-[168px] min-h-12 rounded-3xl border-[#2A2F3A] bg-[#0F1217]/80 py-3 pr-12 pl-4 text-[#E8EAED] placeholder:text-[#8B93A1]/60 focus-visible:border-[#F0A868]/50 focus-visible:ring-[#F0A868]/20"
                 />
                 <Button
                   type="submit"
                   size="icon"
                   variant="ghost"
                   disabled={!composer.trim()}
-                  className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-full text-[#8B93A1] disabled:opacity-30"
+                  className="absolute right-1.5 bottom-1.5 rounded-full text-[#8B93A1] disabled:opacity-30"
                 >
                   <Send className="size-4" />
                 </Button>

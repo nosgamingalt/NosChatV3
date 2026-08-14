@@ -96,6 +96,7 @@ export type DmSummary = {
   other_email: string | null;
   last_message: string | null;
   last_message_at: string | null;
+  unread_count: number;
 };
 
 export type Message = {
@@ -126,6 +127,17 @@ export function sendMessage(token: string, dmId: string, content: string) {
   return req<Message>(`/dms/${dmId}/messages`, token, {
     method: "POST",
     body: JSON.stringify({ content }),
+  });
+}
+
+/**
+ * Marks every message in the DM as read (advances the server-side read
+ * pointer to the latest message). Call when a DM is opened and again
+ * whenever a new message lands while it's the active view.
+ */
+export function markDmRead(token: string, dmId: string) {
+  return req<{ status: string }>(`/dms/${dmId}/read`, token, {
+    method: "POST",
   });
 }
 

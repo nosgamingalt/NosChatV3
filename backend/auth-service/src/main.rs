@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/friends/{id}", axum::routing::delete(friends::remove_friend))
         .route("/dms", get(dms::list_dms).post(dms::open_dm))
         .route("/dms/{id}/messages", get(dms::list_messages).post(dms::send_message))
+        .route("/dms/{id}/read", post(dms::mark_read))
         .route("/me/sounds", get(sounds::get_sounds))
         .route("/me/sounds/{slot}/preset", put(sounds::set_preset))
         .route("/me/sounds/{slot}/upload", post(sounds::upload_custom))
