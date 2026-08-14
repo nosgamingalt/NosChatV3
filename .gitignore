@@ -13,6 +13,12 @@ backend/**/target/
 *.env
 !*.env.example
 
+# Logs (may contain stack traces / connection info from local dev servers)
+*.log
+
+# Local page-dump artifacts (not source files, not meant to be tracked)
+register.html
+
 # OS / editor
 .DS_Store
 Thumbs.db
