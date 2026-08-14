@@ -1,9 +1,13 @@
 mod clerk;
+mod dms;
+mod friends;
 mod routes;
+mod sounds;
 mod webhooks;
+mod ws;
 
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use clerk::ClerkVerifier;
@@ -13,12 +17,14 @@ use sqlx::PgPool;
 use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
+use ws::WsHub;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub clerk_verifier: ClerkVerifier,
     pub clerk_webhook_secret: Option<String>,
+    pub ws_hub: WsHub,
 }
 
 // Required by the `ClerkUser` extractor (see clerk.rs) so it can pull just
@@ -101,12 +107,25 @@ async fn main() -> anyhow::Result<()> {
         db,
         clerk_verifier: ClerkVerifier::new(clerk_jwks_url),
         clerk_webhook_secret,
+        ws_hub: WsHub::default(),
     };
 
     let app = Router::new()
         .route("/health", get(move || health(db_ok)))
         .route("/me", get(routes::me))
         .route("/webhooks/clerk", post(webhooks::clerk_webhook))
+        .route("/ws", get(ws::ws_upgrade))
+        .route("/friends", get(friends::list_friends))
+        .route("/friends/requests", post(friends::send_request))
+        .route("/friends/requests/{id}/accept", post(friends::accept_request))
+        .route("/friends/requests/{id}/decline", post(friends::decline_request))
+        .route("/friends/{id}", axum::routing::delete(friends::remove_friend))
+        .route("/dms", get(dms::list_dms).post(dms::open_dm))
+        .route("/dms/{id}/messages", get(dms::list_messages).post(dms::send_message))
+        .route("/me/sounds", get(sounds::get_sounds))
+        .route("/me/sounds/{slot}/preset", put(sounds::set_preset))
+        .route("/me/sounds/{slot}/upload", post(sounds::upload_custom))
+        .route("/me/sounds/{slot}/file", get(sounds::get_custom_file))
         .fallback(routes::not_found)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
